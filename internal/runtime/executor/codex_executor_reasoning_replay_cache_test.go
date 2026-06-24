@@ -361,6 +361,84 @@ func TestCodexExecutorReasoningReplayCacheDoesNotStoreNativeResponsesRequest(t *
 	}
 }
 
+func TestCodexExecutorResponsesPreviousResponseIDReplaysFunctionCall(t *testing.T) {
+	internalcache.ClearCodexReasoningReplayCache()
+	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
+
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		bodies = append(bodies, body)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if len(bodies) == 1 {
+			_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup_issue","arguments":"{\"id\":\"PER-999\"}","status":"completed"},"output_index":0}` + "\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_prev_1","object":"response","created_at":0,"status":"completed","model":"gpt-5.5","output":[]}}` + "\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_done_2","object":"response","created_at":0,"status":"completed","model":"gpt-5.5","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-responses-previous-response",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+			"api_key":  "test",
+		},
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "gpt-5.5",
+		Payload: []byte(`{
+			"model":"gpt-5.5",
+			"input":"Call lookup_issue for PER-999.",
+			"tools":[{"type":"function","name":"lookup_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}],
+			"tool_choice":{"type":"function","name":"lookup_issue"}
+		}`),
+	}, opts)
+	if err != nil {
+		t.Fatalf("first Execute error: %v", err)
+	}
+
+	_, err = executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "gpt-5.5",
+		Payload: []byte(`{
+			"model":"gpt-5.5",
+			"previous_response_id":"resp_prev_1",
+			"input":[{"type":"function_call_output","call_id":"call_1","output":"{\"id\":\"PER-999\",\"title\":\"synthetic\"}"}]
+		}`),
+	}, opts)
+	if err != nil {
+		t.Fatalf("second Execute error: %v", err)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(bodies))
+	}
+	secondBody := bodies[1]
+	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "function_call" {
+		t.Fatalf("input.0.type = %q, want cached function_call; body=%s", got, string(secondBody))
+	}
+	if got := gjson.GetBytes(secondBody, "input.0.call_id").String(); got != "call_1" {
+		t.Fatalf("input.0.call_id = %q, want call_1; body=%s", got, string(secondBody))
+	}
+	if got := gjson.GetBytes(secondBody, "input.1.type").String(); got != "function_call_output" {
+		t.Fatalf("input.1.type = %q, want function_call_output after cached call; body=%s", got, string(secondBody))
+	}
+	if got := gjson.GetBytes(secondBody, "input.1.call_id").String(); got != "call_1" {
+		t.Fatalf("input.1.call_id = %q, want call_1; body=%s", got, string(secondBody))
+	}
+}
+
 func TestCodexExecutorReasoningReplayCacheDoesNotDuplicateClaudeClientReasoning(t *testing.T) {
 	internalcache.ClearCodexReasoningReplayCache()
 	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
