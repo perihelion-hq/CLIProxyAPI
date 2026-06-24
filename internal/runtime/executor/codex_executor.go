@@ -285,7 +285,8 @@ func codexReasoningReplayScopeFromRequest(ctx context.Context, from sdktranslato
 }
 
 func codexReasoningReplayEnabledForSource(from sdktranslator.Format) bool {
-	return sourceFormatEqual(from, sdktranslator.FormatClaude)
+	return sourceFormatEqual(from, sdktranslator.FormatClaude) ||
+		sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse)
 }
 
 func sourceFormatEqual(from, want sdktranslator.Format) bool {
@@ -303,6 +304,15 @@ func codexClaudeCodeReplaySessionKey(ctx context.Context, payload []byte, header
 func codexReasoningReplaySessionKey(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte) string {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+		if value := codexResponsesReplaySessionKeyFromPayload(body); value != "" {
+			return value
+		}
+		if value := codexResponsesReplaySessionKeyFromPayload(req.Payload); value != "" {
+			return value
+		}
+		return ""
 	}
 	if value := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
 		return "execution:" + value
@@ -365,6 +375,16 @@ func codexReasoningReplaySessionKeyFromPayload(payload []byte) string {
 	}
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
 		return codexReasoningReplaySessionKeyFromTurnMetadata(turnMetadata)
+	}
+	return ""
+}
+
+func codexResponsesReplaySessionKeyFromPayload(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if previousResponseID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()); previousResponseID != "" {
+		return "response-id:" + previousResponseID
 	}
 	return ""
 }
@@ -694,6 +714,17 @@ func cacheCodexReasoningReplayFromCompleted(scope codexReasoningReplayScope, com
 	}
 }
 
+func cacheCodexResponsesReplayFromCompleted(modelName string, completedData []byte) {
+	responseID := strings.TrimSpace(gjson.GetBytes(completedData, "response.id").String())
+	if responseID == "" {
+		return
+	}
+	cacheCodexReasoningReplayFromCompleted(codexReasoningReplayScope{
+		modelName:  modelName,
+		sessionKey: "response-id:" + responseID,
+	}, completedData)
+}
+
 func clearCodexReasoningReplayOnInvalidSignature(ctx context.Context, scope codexReasoningReplayScope, statusCode int, body []byte) error {
 	if !scope.valid() {
 		return nil
@@ -913,6 +944,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			completedData = completedDataPatched
 		}
 		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
+		if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+			cacheCodexResponsesReplayFromCompleted(baseModel, completedData)
+		}
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
