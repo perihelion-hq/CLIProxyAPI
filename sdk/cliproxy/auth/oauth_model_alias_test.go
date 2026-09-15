@@ -208,6 +208,49 @@ func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 	}
 }
 
+func TestApplyOAuthModelAlias_ForceMappingSameBasePreservesSuffix(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"antigravity": {{
+			Name:         "gemini-2.5-pro",
+			Alias:        "gemini-2.5-pro(8192)",
+			ForceMapping: true,
+		}},
+	}
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(aliases)
+
+	auth := &Auth{ID: "test-auth-id", Provider: "antigravity"}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "gemini-2.5-pro(8192)")
+	if resolvedModel != "gemini-2.5-pro(8192)" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gemini-2.5-pro(8192)")
+	}
+}
+
+func TestApplyOAuthModelAlias_PerAuthForceMappingSameBasePreservesSuffix(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+
+	auth := &Auth{
+		ID:       "test-auth-id",
+		Provider: "antigravity",
+		Attributes: map[string]string{
+			"model_aliases": `[{"name":"gemini-2.5-pro","alias":"gemini-2.5-pro(8192)","force-mapping":true}]`,
+		},
+	}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "gemini-2.5-pro(8192)")
+	if resolvedModel != "gemini-2.5-pro(8192)" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gemini-2.5-pro(8192)")
+	}
+}
+
 func TestApplyOAuthModelAlias_PerAuthOverridesGlobalAlias(t *testing.T) {
 	t.Parallel()
 
@@ -255,6 +298,50 @@ func TestApplyOAuthModelAlias_PerAuthAliasSkipsAPIKey(t *testing.T) {
 	}
 }
 
+func TestApplyOAuthModelAlias_Devin(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"devin": {
+			{
+				Name:         "devin/claude-fable-5-1",
+				Alias:        "fable-5-1",
+				Fork:         true,
+				ForceMapping: true,
+			},
+		},
+	}
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(aliases)
+
+	auth := &Auth{ID: "devin-auth", Provider: "devin", Attributes: map[string]string{"auth_kind": "oauth"}}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "fable-5-1")
+	if resolvedModel != "devin/claude-fable-5-1" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "devin/claude-fable-5-1")
+	}
+
+	// Suffix preservation with Devin thinking effort
+	suffixed := mgr.applyOAuthModelAlias(auth, "fable-5-1(max)")
+	if suffixed != "devin/claude-fable-5-1(max)" {
+		t.Errorf("applyOAuthModelAlias() suffixed model = %q, want %q", suffixed, "devin/claude-fable-5-1(max)")
+	}
+
+	// Force mapping result
+	result := mgr.applyOAuthModelAliasWithResult(auth, "fable-5-1(max)")
+	if result.UpstreamModel != "devin/claude-fable-5-1(max)" {
+		t.Errorf("UpstreamModel = %q, want %q", result.UpstreamModel, "devin/claude-fable-5-1(max)")
+	}
+	if !result.ForceMapping {
+		t.Errorf("ForceMapping = false, want true")
+	}
+	if result.OriginalAlias != "fable-5-1" {
+		t.Errorf("OriginalAlias = %q, want %q", result.OriginalAlias, "fable-5-1")
+	}
+}
+
 func TestApplyOAuthModelAlias_PluginProvider(t *testing.T) {
 	t.Parallel()
 
@@ -290,5 +377,55 @@ func TestApplyOAuthModelAlias_PluginProviderSkipsAPIKey(t *testing.T) {
 	resolvedModel := mgr.applyOAuthModelAlias(auth, "sample-latest")
 	if resolvedModel != "sample-latest" {
 		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "sample-latest")
+	}
+}
+func TestApplyOAuthModelAliasWithResult_ForceMappingUsesConfigAliasNotRequestSuffix(t *testing.T) {
+	t.Parallel()
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"codex": {{
+			Name: "gpt-5.4", Alias: "gpt-5.4-fast", Fork: true, ForceMapping: true,
+		}},
+	})
+	auth := &Auth{ID: "t", Provider: "codex"}
+	res := mgr.applyOAuthModelAliasWithResult(auth, "gpt-5.4-fast(high)")
+	if res.UpstreamModel != "gpt-5.4(high)" {
+		t.Fatalf("upstream = %q want gpt-5.4(high)", res.UpstreamModel)
+	}
+	if res.OriginalAlias != "gpt-5.4-fast" {
+		t.Fatalf("OriginalAlias = %q want gpt-5.4-fast", res.OriginalAlias)
+	}
+}
+func TestApplyOAuthModelAliasWithResultPrefersExactSuffixedAlias(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, nil, nil)
+	manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"codex": {
+			{Name: "base-upstream", Alias: "public", Fork: true},
+			{Name: "low-upstream", Alias: "public(low)", Fork: true, ForceMapping: true},
+		},
+	})
+	auth := &Auth{ID: "exact-suffix", Provider: "codex"}
+	result := manager.applyOAuthModelAliasWithResult(auth, "public(low)")
+	if result.UpstreamModel != "low-upstream(low)" || !result.ForceMapping {
+		t.Fatalf("exact suffixed alias result = %+v, want low-upstream(low) with force mapping", result)
+	}
+}
+
+func TestApplyOAuthModelAliasWithResult_NoForceMappingPreservesRequestedModelInOriginalAlias(t *testing.T) {
+	t.Parallel()
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"codex": {{
+			Name: "gpt-5.4", Alias: "gpt-5.4-fast", Fork: true, ForceMapping: false,
+		}},
+	})
+	auth := &Auth{ID: "t", Provider: "codex"}
+	res := mgr.applyOAuthModelAliasWithResult(auth, "gpt-5.4-fast(high)")
+	if res.ForceMapping {
+		t.Fatal("expected ForceMapping false")
+	}
+	if res.OriginalAlias != "gpt-5.4-fast(high)" {
+		t.Fatalf("OriginalAlias = %q want requested model when force-mapping off", res.OriginalAlias)
 	}
 }
