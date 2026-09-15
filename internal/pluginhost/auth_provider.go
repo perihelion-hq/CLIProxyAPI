@@ -110,7 +110,7 @@ func (h *Host) AuthProviderIdentifiers() []string {
 		return nil
 	}
 	out := make([]string, 0)
-	for _, record := range h.Snapshot().records {
+	for _, record := range h.activeRecords() {
 		provider := record.plugin.Capabilities.AuthProvider
 		if provider == nil || h.isPluginFused(record.id) {
 			continue
@@ -132,7 +132,7 @@ func (h *Host) authProviderRecord(provider string) *capabilityRecord {
 	if h == nil || provider == "" {
 		return nil
 	}
-	for _, record := range h.Snapshot().records {
+	for _, record := range h.activeRecords() {
 		authProvider := record.plugin.Capabilities.AuthProvider
 		if authProvider == nil || h.isPluginFused(record.id) {
 			continue
@@ -179,7 +179,7 @@ func (h *Host) ParseAuths(ctx context.Context, req pluginapi.AuthParseRequest) (
 		}
 		return h.callParseAuths(ctx, *record, req)
 	}
-	for _, record := range h.Snapshot().records {
+	for _, record := range h.activeRecords() {
 		if record.plugin.Capabilities.AuthProvider == nil || h.isPluginFused(record.id) {
 			continue
 		}
@@ -201,7 +201,7 @@ func (h *Host) callParseAuth(ctx context.Context, record capabilityRecord, req p
 
 func (h *Host) callParseAuths(ctx context.Context, record capabilityRecord, req pluginapi.AuthParseRequest) (auths []*coreauth.Auth, handled bool, err error) {
 	provider := record.plugin.Capabilities.AuthProvider
-	if h == nil || provider == nil || h.isPluginFused(record.id) {
+	if h == nil || provider == nil || h.isPluginFused(record.id) || !h.recordCurrent(record) {
 		return nil, false, nil
 	}
 	defer func() {
@@ -255,17 +255,21 @@ func pluginAuthParseResponseAuths(resp pluginapi.AuthParseResponse) []pluginapi.
 	return []pluginapi.AuthData{resp.Auth}
 }
 
-func (h *Host) StartLogin(ctx context.Context, provider string, baseURL string) (pluginapi.AuthLoginStartResponse, bool, error) {
+func (h *Host) StartLogin(ctx context.Context, provider string, baseURL string, metadata ...map[string]any) (pluginapi.AuthLoginStartResponse, bool, error) {
 	record := h.authProviderRecord(provider)
 	if record == nil {
 		return pluginapi.AuthLoginStartResponse{}, false, nil
 	}
-	return h.callStartLogin(ctx, *record, provider, baseURL)
+	var startMetadata map[string]any
+	if len(metadata) > 0 {
+		startMetadata = metadata[0]
+	}
+	return h.callStartLogin(ctx, *record, provider, baseURL, startMetadata)
 }
 
-func (h *Host) callStartLogin(ctx context.Context, record capabilityRecord, provider string, baseURL string) (resp pluginapi.AuthLoginStartResponse, handled bool, err error) {
+func (h *Host) callStartLogin(ctx context.Context, record capabilityRecord, provider string, baseURL string, metadata map[string]any) (resp pluginapi.AuthLoginStartResponse, handled bool, err error) {
 	authProvider := record.plugin.Capabilities.AuthProvider
-	if h == nil || authProvider == nil || h.isPluginFused(record.id) {
+	if h == nil || authProvider == nil || h.isPluginFused(record.id) || !h.recordCurrent(record) {
 		return pluginapi.AuthLoginStartResponse{}, false, nil
 	}
 	defer func() {
@@ -281,6 +285,7 @@ func (h *Host) callStartLogin(ctx context.Context, record capabilityRecord, prov
 		BaseURL:    strings.TrimSpace(baseURL),
 		Host:       h.hostConfigSummary(),
 		HTTPClient: h.newHTTPClient(nil),
+		Metadata:   cloneAnyMap(metadata),
 	}
 	resp, errStart := authProvider.StartLogin(ctx, req)
 	if errStart != nil {
@@ -303,7 +308,7 @@ func (h *Host) PollLogin(ctx context.Context, provider, state string, metadata .
 
 func (h *Host) callPollLogin(ctx context.Context, record capabilityRecord, provider, state string, metadata map[string]any) (resp pluginapi.AuthLoginPollResponse, handled bool, err error) {
 	authProvider := record.plugin.Capabilities.AuthProvider
-	if h == nil || authProvider == nil || h.isPluginFused(record.id) {
+	if h == nil || authProvider == nil || h.isPluginFused(record.id) || !h.recordCurrent(record) {
 		return pluginapi.AuthLoginPollResponse{}, false, nil
 	}
 	defer func() {
@@ -334,6 +339,9 @@ func (h *Host) RefreshAuth(ctx context.Context, auth *coreauth.Auth) (refreshed 
 	}
 	record := h.authProviderRecord(authProvider(auth))
 	if record == nil || record.plugin.Capabilities.AuthProvider == nil {
+		return nil, false, nil
+	}
+	if !h.recordCurrent(*record) {
 		return nil, false, nil
 	}
 	defer func() {
@@ -489,6 +497,7 @@ func mergedStorageJSON(raw []byte, metadata map[string]any, provider string) ([]
 	if provider != "" {
 		out["type"] = provider
 	}
+	coreauth.NormalizeCredentialMetadata(out)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("plugin token storage payload is empty")
 	}
